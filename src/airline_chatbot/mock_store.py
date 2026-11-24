@@ -108,6 +108,13 @@ class MockAirlineStore:
     def list_all_flights(self) -> list[dict[str, Any]]:
         return [flight.to_dict() for flight in self._flights.values()]
 
+    def list_all_bookings(self) -> list[dict[str, Any]]:
+        items: list[dict[str, Any]] = []
+        for record in self._bookings.values():
+            flight = self._flights.get(record.flight_id) if record.flight_id else None
+            items.append(record.to_dict(flight=flight))
+        return items
+
     def lookup_booked_ticket(
         self,
         user_id: str,

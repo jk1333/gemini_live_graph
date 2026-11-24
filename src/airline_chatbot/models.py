@@ -52,6 +52,35 @@ class ToolResultStatus(str, Enum):
     RETURNED_TO_ROOT = "RETURNED_TO_ROOT"
 
 
+class HarmCategoryOption(str, Enum):
+    """Supported HarmCategory values for Gemini Live `setup.safetySettings`."""
+
+    HARASSMENT = "HARM_CATEGORY_HARASSMENT"
+    HATE_SPEECH = "HARM_CATEGORY_HATE_SPEECH"
+    SEXUALLY_EXPLICIT = "HARM_CATEGORY_SEXUALLY_EXPLICIT"
+    DANGEROUS_CONTENT = "HARM_CATEGORY_DANGEROUS_CONTENT"
+    CIVIC_INTEGRITY = "HARM_CATEGORY_CIVIC_INTEGRITY"
+
+
+class SafetyThresholdOption(str, Enum):
+    """Supported HarmBlockThreshold values (`DEFAULT` omits `safetySettings`)."""
+
+    DEFAULT = "DEFAULT"
+    BLOCK_LOW_AND_ABOVE = "BLOCK_LOW_AND_ABOVE"
+    BLOCK_MEDIUM_AND_ABOVE = "BLOCK_MEDIUM_AND_ABOVE"
+    BLOCK_ONLY_HIGH = "BLOCK_ONLY_HIGH"
+    BLOCK_NONE = "BLOCK_NONE"
+    OFF = "OFF"
+
+
+CORE_HARM_CATEGORIES: tuple[HarmCategoryOption, ...] = (
+    HarmCategoryOption.HARASSMENT,
+    HarmCategoryOption.HATE_SPEECH,
+    HarmCategoryOption.SEXUALLY_EXPLICIT,
+    HarmCategoryOption.DANGEROUS_CONTENT,
+)
+
+
 @dataclass(frozen=True)
 class FlightSchedule:
     """Mock flight schedule item."""

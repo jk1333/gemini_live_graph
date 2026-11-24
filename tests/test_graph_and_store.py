@@ -229,3 +229,65 @@ def test_endpoint_resolution_vertex_and_developer_api(monkeypatch: pytest.Monkey
     assert "key=test-api-key" in dev_url
     assert dev_model == "models/gemini-3.8-live"
     assert dev_headers == {}
+
+
+def test_safety_settings_builder_and_setup_payload() -> None:
+    from airline_chatbot.cli import resolve_cli_args
+    from airline_chatbot.live_client import (
+        GeminiLiveWebSocketSession,
+        LiveConnectionConfig,
+        build_safety_settings,
+    )
+
+    # 1. DEFAULT omits safetySettings from setup payload
+    assert build_safety_settings("DEFAULT") == []
+    default_session = GeminiLiveWebSocketSession(
+        graph=AirlineStateGraph(),
+        config=LiveConnectionConfig(model="gemini-3.8-live"),
+    )
+    setup_default = default_session.build_setup_payload("models/gemini-3.8-live")
+    assert "safetySettings" not in setup_default["setup"]
+
+    # 2. Preset expands across all 4 core HarmCategories
+    preset = build_safety_settings(threshold="BLOCK_LOW_AND_ABOVE")
+    assert len(preset) == 4
+    assert {item["category"] for item in preset} == {
+        "HARM_CATEGORY_HARASSMENT",
+        "HARM_CATEGORY_HATE_SPEECH",
+        "HARM_CATEGORY_SEXUALLY_EXPLICIT",
+        "HARM_CATEGORY_DANGEROUS_CONTENT",
+    }
+    assert all(item["threshold"] == "BLOCK_LOW_AND_ABOVE" for item in preset)
+
+    strict_session = GeminiLiveWebSocketSession(
+        graph=AirlineStateGraph(),
+        config=LiveConnectionConfig(model="gemini-3.8-live", safety_settings=preset),
+    )
+    setup_strict = strict_session.build_setup_payload("models/gemini-3.8-live")
+    assert setup_strict["setup"]["safetySettings"] == preset
+
+    # 3. Custom per-category JSON & CLI flag parsing
+    custom_json = (
+        '[{"category": "HATE_SPEECH", "threshold": "BLOCK_LOW_AND_ABOVE"}, '
+        '{"category": "HARM_CATEGORY_HARASSMENT", "threshold": "OFF"}, '
+        '{"category": "DANGEROUS_CONTENT", "threshold": "DEFAULT"}]'
+    )
+    _, parsed_cfg, parsed_gr = resolve_cli_args(
+        [
+            "--project",
+            "demo",
+            "--safety-settings-json",
+            custom_json,
+            "--no-guardrail",
+        ]
+    )
+    assert parsed_gr.enabled is False
+    assert parsed_cfg.safety_settings == [
+        {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_LOW_AND_ABOVE"},
+        {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "OFF"},
+    ]
+
+    # 4. Invalid threshold raises ValueError
+    with pytest.raises(ValueError):
+        build_safety_settings(threshold="INVALID_THRESHOLD")
+

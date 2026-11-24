@@ -191,7 +191,9 @@ def _exercise_live_websocket_protocol_sans_io() -> None:
     turn1_payload = session.prepare_user_turn_payload("예약 티켓 조회할래요")
     session._turn_complete.clear()
     _drive_sync_coro(session._send_json(turn1_payload))
-    assert server_inbox.pop(0) == {"realtimeInput": {"text": "예약 티켓 조회할래요"}}
+    turn1_sent = server_inbox.pop(0)
+    assert "현재 노드=ROOT_MENU" in turn1_sent["realtimeInput"]["text"]
+    assert turn1_sent["realtimeInput"]["text"].endswith("예약 티켓 조회할래요")
 
     server_send(
         json.dumps(
@@ -233,7 +235,9 @@ def _exercise_live_websocket_protocol_sans_io() -> None:
     turn2_payload = session.prepare_user_turn_payload("아이디 user01 예약번호 BK-1001")
     session._turn_complete.clear()
     _drive_sync_coro(session._send_json(turn2_payload))
-    assert server_inbox.pop(0) == {"realtimeInput": {"text": "아이디 user01 예약번호 BK-1001"}}
+    turn2_sent = server_inbox.pop(0)
+    assert "현재 노드=TICKET_LOOKUP" in turn2_sent["realtimeInput"]["text"]
+    assert turn2_sent["realtimeInput"]["text"].endswith("아이디 user01 예약번호 BK-1001")
 
     server_send(
         json.dumps(
@@ -297,7 +301,8 @@ async def _exercise_live_websocket_protocol() -> None:
 
             turn1_msg = await _recv_json(ws)
             received_frames.append(turn1_msg)
-            assert turn1_msg == {"realtimeInput": {"text": "예약 티켓 조회할래요"}}
+            assert "현재 노드=ROOT_MENU" in turn1_msg["realtimeInput"]["text"]
+            assert turn1_msg["realtimeInput"]["text"].endswith("예약 티켓 조회할래요")
 
             await ws.send(
                 json.dumps(
@@ -340,7 +345,8 @@ async def _exercise_live_websocket_protocol() -> None:
 
             turn2_msg = await _recv_json(ws)
             received_frames.append(turn2_msg)
-            assert turn2_msg == {"realtimeInput": {"text": "아이디 user01 예약번호 BK-1001"}}
+            assert "현재 노드=TICKET_LOOKUP" in turn2_msg["realtimeInput"]["text"]
+            assert turn2_msg["realtimeInput"]["text"].endswith("아이디 user01 예약번호 BK-1001")
 
             await ws.send(
                 json.dumps(
@@ -602,3 +608,82 @@ def test_vertex_intermediate_turn_complete_and_danang_schedule_regression() -> N
         sent_by_client[2]["contextUpdate"]["tools"]["tools"][0]["functionDeclarations"][0]["name"]
         == "route_menu"
     )
+
+    # Turn 3 (Second cycle from ROOT_MENU!): User asks for schedule lookup again
+    sent_by_client.clear()
+    turn3 = session.prepare_user_turn_payload("제주행 비행기 일정 다시 조회해줘")
+    assert "현재 노드=ROOT_MENU, 활성 단일 도구=route_menu" in turn3["realtimeInput"]["text"]
+    assert "먼저 route_menu 도구를 호출하고" in turn3["realtimeInput"]["text"]
+    assert graph.slots.arrival_code == "CJU"
+    session._turn_complete.clear()
+    _drive_sync_coro(session._send_json(turn3))
+
+    _drive_sync_coro(
+        session.process_incoming_frame(
+            json.dumps(
+                {
+                    "toolCall": {
+                        "functionCalls": [
+                            {
+                                "id": "call_sched_route_2",
+                                "name": "route_menu",
+                                "args": {"decision": "CHECK_SCHEDULE"},
+                            }
+                        ]
+                    }
+                }
+            )
+        )
+    )
+    _drive_sync_coro(
+        session.process_incoming_frame(
+            json.dumps(
+                {
+                    "serverContent": {
+                        "outputTranscription": {"text": "제주행 일정을 확인해 드릴까요?"},
+                        "turnComplete": True,
+                        "interactionStatus": "IDLE",
+                    }
+                }
+            )
+        )
+    )
+    assert graph.current_node == NodeId.SCHEDULE_LOOKUP
+    assert transitions == [
+        NodeId.SCHEDULE_LOOKUP,
+        NodeId.ROOT_MENU,
+        NodeId.SCHEDULE_LOOKUP,
+    ]
+
+
+def test_one_shot_schedule_auto_continue_and_silent_fallback() -> None:
+    graph = AirlineStateGraph()
+
+    # 1. Incomplete menu request ("비행기 일정 조회") -> should_auto_execute is False + fallback works
+    graph.ingest_user_text("비행기 일정 조회")
+    res_incomplete = graph.handle_tool_call("route_menu", {"decision": "CHECK_SCHEDULE"})
+    assert graph.current_node == NodeId.SCHEDULE_LOOKUP
+    assert graph.should_auto_execute_current_node() is False
+    fallback = AirlineStateGraph.build_silent_turn_fallback(res_incomplete)
+    assert "운항 일정 조회" in fallback
+
+    # 2. Reset and test one-shot ("다낭행 비행기 일정 알려줘") -> should_auto_execute is True!
+    graph.force_reset_to_root()
+    session = GeminiLiveWebSocketSession(
+        graph=graph,
+        config=LiveConnectionConfig(model="gemini-3.8-live", ws_url_override="ws://127.0.0.1:8765/ws"),
+    )
+    init_payload = session.prepare_user_turn_payload("다낭행 비행기 일정 알려줘")
+    assert "현재 노드=ROOT_MENU" in init_payload["realtimeInput"]["text"]
+    assert graph.slots.arrival_code == "DAD"
+
+    graph.handle_tool_call("route_menu", {"decision": "CHECK_SCHEDULE"})
+    graph.consume_pending_context_update()
+    assert graph.current_node == NodeId.SCHEDULE_LOOKUP
+    assert graph.should_auto_execute_current_node() is True
+
+    cont_payload = session.build_auto_continue_payload("다낭행 비행기 일정 알려줘")
+    assert "현재 노드=SCHEDULE_LOOKUP" in cont_payload["realtimeInput"]["text"]
+    assert 'decide_schedule_lookup(decision="EXECUTE")' in cont_payload["realtimeInput"]["text"]
+
+

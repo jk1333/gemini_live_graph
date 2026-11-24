@@ -45,9 +45,137 @@ class AirlineStateGraph:
             "tools": build_tools(target),
         }
 
+    def get_state_snapshot(self) -> dict[str, Any]:
+        """Returns a complete JSON-serializable snapshot of the graph & mock DB state."""
+        active_ctx = self.get_context_config(self.current_node)
+        active_decl = active_ctx["tools"][0]["functionDeclarations"][0]
+        return {
+            "current_node": self.current_node.value,
+            "pending_context_node": (
+                self._pending_context_node.value if self._pending_context_node else None
+            ),
+            "slots": self.slots.to_dict(),
+            "active_tool": active_decl,
+            "system_instruction": active_ctx["systemInstruction"]["parts"][0]["text"],
+            "flights": self.store.list_all_flights(),
+            "bookings": self.store.list_all_bookings(),
+        }
+
+    @staticmethod
+    def get_topology_metadata() -> dict[str, Any]:
+        """Returns static node & edge definitions for the frontend State Graph visualizer."""
+        node_labels: dict[NodeId, tuple[str, str]] = {
+            NodeId.ROOT_MENU: ("초기 메뉴 분기", "고객 의도 파악 및 3대 기능 분기"),
+            NodeId.TICKET_LOOKUP: ("1. 예약 티켓 조회", "user_id + booking_number 검증 및 조회"),
+            NodeId.SCHEDULE_LOOKUP: ("2. 비행기 일정 조회", "출도착지/날짜 필터 또는 전체 일정 조회"),
+            NodeId.BOOKING_AUTH: ("3-A. 예약 인증", "user_id + 사전 예약번호 검증"),
+            NodeId.BOOKING_CONFIRM: ("3-B. 항공편 확정", "항공편 편명 선택 및 좌석 확정"),
+        }
+        nodes: list[dict[str, Any]] = []
+        for node in NodeId:
+            title, subtitle = node_labels[node]
+            decl = build_tools(node)[0]["functionDeclarations"][0]
+            si_text = build_system_instruction(node)["parts"][0]["text"]
+            nodes.append(
+                {
+                    "id": node.value,
+                    "title": title,
+                    "subtitle": subtitle,
+                    "tool": decl,
+                    "system_instruction": si_text,
+                }
+            )
+
+        edges: list[dict[str, str]] = [
+            {
+                "id": "ROOT_MENU->TICKET_LOOKUP",
+                "source": NodeId.ROOT_MENU.value,
+                "target": NodeId.TICKET_LOOKUP.value,
+                "label": "CHECK_TICKET",
+                "kind": "forward",
+            },
+            {
+                "id": "ROOT_MENU->SCHEDULE_LOOKUP",
+                "source": NodeId.ROOT_MENU.value,
+                "target": NodeId.SCHEDULE_LOOKUP.value,
+                "label": "CHECK_SCHEDULE",
+                "kind": "forward",
+            },
+            {
+                "id": "ROOT_MENU->BOOKING_AUTH",
+                "source": NodeId.ROOT_MENU.value,
+                "target": NodeId.BOOKING_AUTH.value,
+                "label": "BOOK_TICKET",
+                "kind": "forward",
+            },
+            {
+                "id": "BOOKING_AUTH->BOOKING_CONFIRM",
+                "source": NodeId.BOOKING_AUTH.value,
+                "target": NodeId.BOOKING_CONFIRM.value,
+                "label": "EXECUTE (인증 통과)",
+                "kind": "forward",
+            },
+            {
+                "id": "TICKET_LOOKUP->ROOT_MENU",
+                "source": NodeId.TICKET_LOOKUP.value,
+                "target": NodeId.ROOT_MENU.value,
+                "label": "완료 / RETURN_TO_ROOT",
+                "kind": "return",
+            },
+            {
+                "id": "SCHEDULE_LOOKUP->ROOT_MENU",
+                "source": NodeId.SCHEDULE_LOOKUP.value,
+                "target": NodeId.ROOT_MENU.value,
+                "label": "완료 / RETURN_TO_ROOT",
+                "kind": "return",
+            },
+            {
+                "id": "BOOKING_AUTH->ROOT_MENU",
+                "source": NodeId.BOOKING_AUTH.value,
+                "target": NodeId.ROOT_MENU.value,
+                "label": "RETURN_TO_ROOT",
+                "kind": "return",
+            },
+            {
+                "id": "BOOKING_CONFIRM->ROOT_MENU",
+                "source": NodeId.BOOKING_CONFIRM.value,
+                "target": NodeId.ROOT_MENU.value,
+                "label": "확정 완료 / RETURN_TO_ROOT",
+                "kind": "return",
+            },
+        ]
+        return {"nodes": nodes, "edges": edges}
+
     def ingest_user_text(self, text: str) -> None:
         """Extracts slot candidates from user input prior to streaming `realtimeInput`."""
         SlotExtractor.extract_into(text, self.slots, self.current_node)
+
+    def should_auto_execute_current_node(self) -> bool:
+        """Returns True if the active branch node already has enough extracted slots to execute."""
+        if self.current_node in {NodeId.TICKET_LOOKUP, NodeId.BOOKING_AUTH}:
+            return bool(self.slots.user_id and self.slots.booking_number)
+        if self.current_node == NodeId.SCHEDULE_LOOKUP:
+            return bool(
+                self.slots.departure_code
+                or self.slots.arrival_code
+                or self.slots.date
+                or self.slots.query_all_schedules
+            )
+        return False
+
+    @staticmethod
+    def build_silent_turn_fallback(result: DecisionResult) -> str:
+        """Customer-facing Korean fallback text if the audio model completes silently after a tool call."""
+        if result.status == ToolResultStatus.DECISION_ROUTED:
+            if result.active_node == NodeId.TICKET_LOOKUP:
+                return "네, 예약된 비행기 티켓 조회를 도와드리겠습니다. 사용자 ID와 예약 번호(예: BK-1001)를 입력해 주세요."
+            if result.active_node == NodeId.SCHEDULE_LOOKUP:
+                return "네, 비행기 운항 일정 조회를 도와드리겠습니다. 원하시는 출발지/도착지 노선이나 전체 일정 조회 여부를 말씀해 주세요."
+            if result.active_node == NodeId.BOOKING_AUTH:
+                return "네, 비행기 티켓 예약을 도와드리겠습니다. 먼저 사용자 ID와 사전 발급된 예약 번호(예: BK-2001)를 입력해 주세요."
+        if result.status == ToolResultStatus.RETURNED_TO_ROOT:
+            return "네, 초기 메인 메뉴로 돌아왔습니다. 예약 티켓 조회, 비행기 일정 조회, 티켓 예약 중 어떤 업무를 도와드릴까요?"
+        return result.message
 
     def force_reset_to_root(self) -> dict[str, Any]:
         """Forces an immediate transition back to `ROOT_MENU` (used by CLI `/reset`)."""
@@ -108,51 +236,54 @@ class AirlineStateGraph:
 
         if decision == RootDecision.CHECK_TICKET:
             self._transition_to(NodeId.TICKET_LOOKUP)
-            detected_hint = self._format_auth_slot_hint()
-            return DecisionResult(
-                status=ToolResultStatus.DECISION_ROUTED,
-                decision=decision.value,
-                active_node=self.current_node,
-                retryable=False,
-                message=(
+            if self.should_auto_execute_current_node():
+                msg = "예약된 비행기 티켓 조회 단계로 이동했습니다. 입력해 주신 정보로 바로 확인해 드리겠다고 짧게 한 문장으로 안내하세요."
+            else:
+                detected_hint = self._format_auth_slot_hint()
+                msg = (
                     "예약된 비행기 티켓 조회 단계로 이동했습니다. "
                     f"고객에게 사용자 ID와 예약 번호(예: BK-1001)를 요청하세요.{detected_hint}"
-                ),
-                data={"collected_slots": self.slots.to_dict()},
-            )
-
-        if decision == RootDecision.CHECK_SCHEDULE:
-            self._transition_to(NodeId.SCHEDULE_LOOKUP)
-            route_hint = ""
-            if self.slots.departure_code or self.slots.arrival_code or self.slots.date:
-                route_hint = (
-                    f" (이미 감지된 조건: 출발={self.slots.departure_code}, "
-                    f"도착={self.slots.arrival_code}, 날짜={self.slots.date} — 해당 조건으로 바로 조회할지 확인하세요.)"
                 )
             return DecisionResult(
                 status=ToolResultStatus.DECISION_ROUTED,
                 decision=decision.value,
                 active_node=self.current_node,
                 retryable=False,
-                message=(
-                    "비행기 일정 조회 단계로 이동했습니다. 조회를 원하는 출발지/도착지 노선이나 전체 일정 조회 여부를 물어보세요."
-                    f"{route_hint}"
-                ),
+                message=msg,
+                data={"collected_slots": self.slots.to_dict()},
+            )
+
+        if decision == RootDecision.CHECK_SCHEDULE:
+            self._transition_to(NodeId.SCHEDULE_LOOKUP)
+            if self.should_auto_execute_current_node():
+                msg = "비행기 일정 조회 단계로 이동했습니다. 요청하신 노선 일정을 바로 확인해 드리겠다고 짧게 한 문장으로 안내하세요."
+            else:
+                msg = "비행기 일정 조회 단계로 이동했습니다. 조회를 원하는 출발지/도착지 노선이나 전체 일정 조회 여부를 한국어로 물어보세요."
+            return DecisionResult(
+                status=ToolResultStatus.DECISION_ROUTED,
+                decision=decision.value,
+                active_node=self.current_node,
+                retryable=False,
+                message=msg,
                 data={"collected_slots": self.slots.to_dict()},
             )
 
         # RootDecision.BOOK_TICKET
         self._transition_to(NodeId.BOOKING_AUTH)
-        detected_hint = self._format_auth_slot_hint()
+        if self.should_auto_execute_current_node():
+            msg = "비행기 티켓 예약 인증 단계로 이동했습니다. 입력해 주신 계정과 예약 번호를 바로 확인하겠다고 짧게 안내하세요."
+        else:
+            detected_hint = self._format_auth_slot_hint()
+            msg = (
+                "비행기 티켓 예약 인증 단계로 이동했습니다. "
+                f"예약을 위해 사용자 ID와 사전 발급된 예약 번호(예: BK-2001)를 입력해 달라고 안내하세요.{detected_hint}"
+            )
         return DecisionResult(
             status=ToolResultStatus.DECISION_ROUTED,
             decision=decision.value,
             active_node=self.current_node,
             retryable=False,
-            message=(
-                "비행기 티켓 예약 인증 단계로 이동했습니다. "
-                f"예약을 위해 사용자 ID와 사전 발급된 예약 번호(예: BK-2001)를 입력해 달라고 안내하세요.{detected_hint}"
-            ),
+            message=msg,
             data={"collected_slots": self.slots.to_dict()},
         )
 
@@ -233,7 +364,10 @@ class AirlineStateGraph:
             decision=StepDecision.EXECUTE.value,
             active_node=self.current_node,
             retryable=False,
-            message=msg,
+            message=(
+                f"{msg} "
+                "(시스템 안내: 이번 답변 후 상태가 ROOT_MENU로 초기화됩니다. 다음 턴에 고객이 다시 조회/일정/예약을 요청하면 반드시 route_menu 도구를 새로 호출하세요.)"
+            ),
             data=payload,
         )
 
@@ -249,7 +383,10 @@ class AirlineStateGraph:
             decision=StepDecision.EXECUTE.value,
             active_node=self.current_node,
             retryable=False,
-            message=msg,
+            message=(
+                f"{msg} "
+                "(시스템 안내: 이번 답변 후 상태가 ROOT_MENU로 초기화됩니다. 다음 턴에 고객이 다시 비행기 일정 조회나 티켓 조회/예약을 요청하면 직접 되묻지 말고 반드시 route_menu 도구를 새로 호출하세요.)"
+            ),
             data=payload,
         )
 
@@ -329,7 +466,10 @@ class AirlineStateGraph:
             decision=StepDecision.EXECUTE.value,
             active_node=self.current_node,
             retryable=False,
-            message=msg,
+            message=(
+                f"{msg} "
+                "(시스템 안내: 이번 답변 후 상태가 ROOT_MENU로 초기화됩니다. 다음 턴에 고객이 다시 조회/일정/예약을 요청하면 반드시 route_menu 도구를 새로 호출하세요.)"
+            ),
             data=payload,
         )
 

@@ -5,13 +5,16 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "airline-chatbot"
 version = "0.1.0"
-description = "Gemini 3.8 Live API WebSocket + State Graph Airline Ticket Chatbot Sample"
+description = "Gemini 3.8 Live API WebSocket + State Graph Airline Ticket Chatbot (HTML Web App & CLI)"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
     "websockets>=13.0",
     "google-auth>=2.35.0",
     "python-dotenv>=1.0.1",
+    "fastapi>=0.100.0",
+    "uvicorn>=0.23.0",
+    "httpx>=0.27.0",
 ]
 
 [project.optional-dependencies]
@@ -21,9 +24,13 @@ dev = [
 
 [project.scripts]
 airline-chat = "airline_chatbot.cli:main"
+airline-web = "airline_chatbot.web:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+airline_chatbot = ["static/*.html"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

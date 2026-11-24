@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import json
 import os
 from typing import Any
@@ -21,7 +21,115 @@ import websockets
 from websockets.asyncio.client import ClientConnection
 
 from airline_chatbot.graph import AirlineStateGraph
-from airline_chatbot.models import DecisionResult, NodeId
+from airline_chatbot.models import (
+    CORE_HARM_CATEGORIES,
+    DecisionResult,
+    HarmCategoryOption,
+    NodeId,
+    SafetyThresholdOption,
+)
+from airline_chatbot.prompts_and_tools import NODE_TOOL_NAMES
+
+
+_THRESHOLD_ALIASES: dict[str, SafetyThresholdOption] = {
+    "DEFAULT": SafetyThresholdOption.DEFAULT,
+    "LOW": SafetyThresholdOption.BLOCK_LOW_AND_ABOVE,
+    "BLOCK_LOW_AND_ABOVE": SafetyThresholdOption.BLOCK_LOW_AND_ABOVE,
+    "MEDIUM": SafetyThresholdOption.BLOCK_MEDIUM_AND_ABOVE,
+    "BLOCK_MEDIUM_AND_ABOVE": SafetyThresholdOption.BLOCK_MEDIUM_AND_ABOVE,
+    "HIGH": SafetyThresholdOption.BLOCK_ONLY_HIGH,
+    "BLOCK_ONLY_HIGH": SafetyThresholdOption.BLOCK_ONLY_HIGH,
+    "NONE": SafetyThresholdOption.BLOCK_NONE,
+    "BLOCK_NONE": SafetyThresholdOption.BLOCK_NONE,
+    "OFF": SafetyThresholdOption.OFF,
+}
+
+_CATEGORY_ALIASES: dict[str, HarmCategoryOption] = {
+    "HARASSMENT": HarmCategoryOption.HARASSMENT,
+    "HARM_CATEGORY_HARASSMENT": HarmCategoryOption.HARASSMENT,
+    "HATE_SPEECH": HarmCategoryOption.HATE_SPEECH,
+    "HARM_CATEGORY_HATE_SPEECH": HarmCategoryOption.HATE_SPEECH,
+    "SEXUALLY_EXPLICIT": HarmCategoryOption.SEXUALLY_EXPLICIT,
+    "HARM_CATEGORY_SEXUALLY_EXPLICIT": HarmCategoryOption.SEXUALLY_EXPLICIT,
+    "DANGEROUS_CONTENT": HarmCategoryOption.DANGEROUS_CONTENT,
+    "HARM_CATEGORY_DANGEROUS_CONTENT": HarmCategoryOption.DANGEROUS_CONTENT,
+    "CIVIC_INTEGRITY": HarmCategoryOption.CIVIC_INTEGRITY,
+    "HARM_CATEGORY_CIVIC_INTEGRITY": HarmCategoryOption.CIVIC_INTEGRITY,
+}
+
+
+def normalize_safety_threshold(raw: str) -> SafetyThresholdOption:
+    key = raw.strip().upper()
+    if key not in _THRESHOLD_ALIASES:
+        allowed = ", ".join(opt.value for opt in SafetyThresholdOption)
+        raise ValueError(
+            f"지원하지 않는 safety threshold 값입니다: '{raw}'. 허용 값: {allowed}"
+        )
+    return _THRESHOLD_ALIASES[key]
+
+
+def normalize_harm_category(raw: str) -> HarmCategoryOption:
+    key = raw.strip().upper()
+    if key not in _CATEGORY_ALIASES:
+        allowed = ", ".join(opt.value for opt in HarmCategoryOption)
+        raise ValueError(
+            f"지원하지 않는 harm category 값입니다: '{raw}'. 허용 값: {allowed}"
+        )
+    return _CATEGORY_ALIASES[key]
+
+
+def build_safety_settings(
+    threshold: str | None = None,
+    custom_settings: str | list[dict[str, str]] | None = None,
+) -> list[dict[str, str]]:
+    """Builds validated `safetySettings` array for `BidiGenerateContentSetup`.
+
+    - If `custom_settings` (JSON string or list of `{category, threshold}` dicts) is
+      given, validates and normalizes each entry (omitting entries set to `DEFAULT`).
+    - Otherwise, if `threshold` is given and not `DEFAULT`, applies that threshold
+      across all 4 core harm categories.
+    - Returns `[]` when using model defaults.
+    """
+    if custom_settings is not None:
+        if isinstance(custom_settings, str):
+            stripped = custom_settings.strip()
+            if not stripped:
+                parsed_list: list[Any] = []
+            else:
+                parsed = json.loads(stripped)
+                if not isinstance(parsed, list):
+                    raise ValueError(
+                        "safety_settings JSON은 [{'category': ..., 'threshold': ...}] 배열이어야 합니다."
+                    )
+                parsed_list = parsed
+        else:
+            parsed_list = list(custom_settings)
+
+        normalized: list[dict[str, str]] = []
+        seen_categories: set[str] = set()
+        for item in parsed_list:
+            if not isinstance(item, dict):
+                raise ValueError("각 safety setting 항목은 JSON 객체여야 합니다.")
+            cat = normalize_harm_category(str(item.get("category", "")))
+            thr = normalize_safety_threshold(str(item.get("threshold", "")))
+            if thr == SafetyThresholdOption.DEFAULT:
+                continue
+            if cat.value in seen_categories:
+                normalized = [x for x in normalized if x["category"] != cat.value]
+            seen_categories.add(cat.value)
+            normalized.append({"category": cat.value, "threshold": thr.value})
+        return normalized
+
+    if threshold and threshold.strip():
+        thr_opt = normalize_safety_threshold(threshold)
+        if thr_opt == SafetyThresholdOption.DEFAULT:
+            return []
+        return [
+            {"category": cat.value, "threshold": thr_opt.value}
+            for cat in CORE_HARM_CATEGORIES
+        ]
+
+    return []
 
 
 @dataclass
@@ -34,17 +142,25 @@ class LiveConnectionConfig:
     api_key: str | None = None
     ws_url_override: str | None = None
     language_code: str = "ko-KR"
+    safety_settings: list[dict[str, str]] = field(default_factory=list)
     setup_timeout_sec: float = 20.0
     turn_timeout_sec: float = 60.0
 
     @classmethod
     def from_env(cls) -> LiveConnectionConfig:
+        env_threshold = os.getenv("GEMINI_SAFETY_THRESHOLD", "").strip() or None
+        env_json = os.getenv("GEMINI_SAFETY_SETTINGS_JSON", "").strip() or None
+        safety = build_safety_settings(
+            threshold=env_threshold,
+            custom_settings=env_json,
+        )
         return cls(
             model=os.getenv("GEMINI_LIVE_MODEL", "gemini-3.8-live").strip(),
             project_id=os.getenv("GOOGLE_CLOUD_PROJECT", "").strip() or None,
             location=os.getenv("GOOGLE_CLOUD_LOCATION", "us-central1").strip(),
             api_key=os.getenv("GEMINI_API_KEY", "").strip() or None,
             ws_url_override=os.getenv("GEMINI_WS_URL_OVERRIDE", "").strip() or None,
+            safety_settings=safety,
         )
 
     def resolve_endpoint_and_headers(self) -> tuple[str, str, dict[str, str]]:
@@ -126,6 +242,7 @@ class GeminiLiveWebSocketSession:
         on_text_chunk: Callable[[str], None] | None = None,
         on_tool_event: Callable[[str, dict[str, Any], DecisionResult], None] | None = None,
         on_context_update: Callable[[NodeId], None] | None = None,
+        on_slots_updated: Callable[[], None] | None = None,
         on_status: Callable[[str], None] | None = None,
     ) -> None:
         self.graph = graph
@@ -133,6 +250,7 @@ class GeminiLiveWebSocketSession:
         self._on_text_chunk = on_text_chunk or (lambda _: None)
         self._on_tool_event = on_tool_event or (lambda *_: None)
         self._on_context_update = on_context_update or (lambda _: None)
+        self._on_slots_updated = on_slots_updated or (lambda: None)
         self._on_status = on_status or (lambda _: None)
 
         self._ws: Any = None
@@ -144,6 +262,8 @@ class GeminiLiveWebSocketSession:
         self._emitted_transcription = False
         self._awaiting_post_tool_turn = False
         self._received_post_tool_content = False
+        self._emitted_text_since_tool = False
+        self._last_tool_result: DecisionResult | None = None
 
     async def __aenter__(self) -> GeminiLiveWebSocketSession:
         await self.connect()
@@ -155,23 +275,24 @@ class GeminiLiveWebSocketSession:
     def build_setup_payload(self, model_resource: str) -> dict[str, Any]:
         """Builds the initial `setup` frame payload for `ROOT_MENU`."""
         initial_ctx = self.graph.get_context_config(NodeId.ROOT_MENU)
-        return {
-            "setup": {
-                "model": model_resource,
-                "generationConfig": {
-                    "responseModalities": ["AUDIO"],
-                    "speechConfig": {
-                        "languageCode": self.config.language_code,
-                    },
+        setup_body: dict[str, Any] = {
+            "model": model_resource,
+            "generationConfig": {
+                "responseModalities": ["AUDIO"],
+                "speechConfig": {
+                    "languageCode": self.config.language_code,
                 },
-                "outputAudioTranscription": {},
-                "contextWindowCompression": {
-                    "slidingWindow": {},
-                },
-                "systemInstruction": initial_ctx["systemInstruction"],
-                "tools": initial_ctx["tools"],
-            }
+            },
+            "outputAudioTranscription": {},
+            "contextWindowCompression": {
+                "slidingWindow": {},
+            },
+            "systemInstruction": initial_ctx["systemInstruction"],
+            "tools": initial_ctx["tools"],
         }
+        if self.config.safety_settings:
+            setup_body["safetySettings"] = self.config.safety_settings
+        return {"setup": setup_body}
 
     @staticmethod
     def build_context_update_payload(context_config: dict[str, Any]) -> dict[str, Any]:
@@ -251,23 +372,63 @@ class GeminiLiveWebSocketSession:
                 pass
 
     def prepare_user_turn_payload(self, text: str) -> dict[str, Any]:
-        """Extracts slots from user text and builds the `realtimeInput` JSON frame."""
+        """Extracts slots from user text and builds the state-tagged `realtimeInput` JSON frame."""
         self.graph.ingest_user_text(text)
+        self._on_slots_updated()
         self._awaiting_post_tool_turn = False
         self._received_post_tool_content = False
+        self._emitted_text_since_tool = False
+        self._last_tool_result = None
+
+        active_node = self.graph.current_node
+        active_tool = NODE_TOOL_NAMES[active_node]
+        if active_node == NodeId.ROOT_MENU:
+            state_tagged_text = (
+                "[시스템 상태: 현재 노드=ROOT_MENU, 활성 단일 도구=route_menu | "
+                "필수 지침: 티켓 조회·비행기 일정 조회·티켓 예약 요청이면 먼저 route_menu 도구를 호출하고, "
+                "toolResponse를 받은 뒤에는 반드시 고객에게 한국어로 안내 문장을 답변하세요]\n"
+                f"{text}"
+            )
+        else:
+            state_tagged_text = (
+                f"[시스템 상태: 현재 노드={active_node.value}, 활성 단일 도구={active_tool} | "
+                "toolResponse 수신 후에는 반드시 한국어로 결과를 안내하세요]\n"
+                f"{text}"
+            )
         return {
             "realtimeInput": {
-                "text": text,
+                "text": state_tagged_text,
+            }
+        }
+
+    def build_auto_continue_payload(self, original_user_text: str) -> dict[str, Any]:
+        """Builds a continuation frame after `ROOT_MENU` routes to a branch whose slots are already filled."""
+        self._awaiting_post_tool_turn = False
+        self._received_post_tool_content = False
+        self._emitted_text_since_tool = False
+        self._last_tool_result = None
+
+        active_node = self.graph.current_node
+        active_tool = NODE_TOOL_NAMES[active_node]
+        prompt = (
+            f"[시스템 상태: 현재 노드={active_node.value}, 활성 단일 도구={active_tool} | "
+            f"필수 지침: 고객이 이미 필요한 조건('{original_user_text}')을 모두 전달했습니다. "
+            f"즉시 {active_tool}(decision=\"EXECUTE\") 도구를 호출한 뒤 조회/검증 결과를 고객에게 한국어로 상세히 답변하세요]"
+        )
+        return {
+            "realtimeInput": {
+                "text": prompt,
             }
         }
 
     async def send_user_turn(self, text: str) -> None:
-        """Extracts slots, sends `realtimeInput.text`, and waits for turn + contextUpdate."""
+        """Extracts slots, sends `realtimeInput.text`, and auto-executes 1 hop if slots are complete."""
         if self._ws is None:
             raise RuntimeError("WebSocket 세션이 연결되어 있지 않습니다.")
         if self._closed_error is not None:
             raise RuntimeError(f"세션이 이미 종료되었습니다: {self._closed_error}")
 
+        started_at_root = self.graph.current_node == NodeId.ROOT_MENU
         payload = self.prepare_user_turn_payload(text)
         self._turn_complete.clear()
 
@@ -279,6 +440,33 @@ class GeminiLiveWebSocketSession:
         )
         if self._closed_error is not None:
             raise RuntimeError(f"응답 대기 중 연결 오류 발생: {self._closed_error}")
+
+        # If the user spoke a complete one-shot request at ROOT_MENU (e.g., "다낭행 비행기 일정 알려줘"
+        # or "아이디 user01 예약번호 BK-1001 조회"), `route_menu` just transitioned to the branch node
+        # and flushed `contextUpdate`. Immediately continue 1 hop so the user gets the actual answer!
+        if (
+            started_at_root
+            and self.graph.current_node != NodeId.ROOT_MENU
+            and self.graph.should_auto_execute_current_node()
+        ):
+            cont_payload = self.build_auto_continue_payload(text)
+            self._turn_complete.clear()
+            await self._send_json(cont_payload)
+            await asyncio.wait_for(
+                self._turn_complete.wait(),
+                timeout=self.config.turn_timeout_sec,
+            )
+            if self._closed_error is not None:
+                raise RuntimeError(f"자동 연속 실행 중 연결 오류 발생: {self._closed_error}")
+
+        # Safety net: if a tool call occurred and the audio model produced zero spoken text,
+        # emit a natural Korean fallback message so the user never sees a silent transition.
+        if self._last_tool_result is not None and not self._emitted_text_since_tool:
+            fallback_msg = AirlineStateGraph.build_silent_turn_fallback(
+                self._last_tool_result
+            )
+            if fallback_msg:
+                self._on_text_chunk(fallback_msg)
 
     async def send_manual_reset(self) -> None:
         """Forces an immediate mid-session `contextUpdate` back to `ROOT_MENU`."""
@@ -333,10 +521,12 @@ class GeminiLiveWebSocketSession:
 
             if out_trans and out_trans.get("text"):
                 self._emitted_transcription = True
+                self._emitted_text_since_tool = True
                 self._on_text_chunk(str(out_trans["text"]))
             elif not self._emitted_transcription and model_turn:
                 for part in model_turn.get("parts", []):
                     if part.get("text") and not part.get("thought"):
+                        self._emitted_text_since_tool = True
                         self._on_text_chunk(str(part["text"]))
 
         if tool_call:
@@ -434,6 +624,8 @@ class GeminiLiveWebSocketSession:
             args = call.get("args") or {}
 
             result = self.graph.handle_tool_call(func_name, args)
+            self._last_tool_result = result
+            self._emitted_text_since_tool = False
             self._on_tool_event(func_name, args, result)
 
             resp_entry: dict[str, Any] = {
